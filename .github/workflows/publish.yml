@@ -26,7 +26,7 @@ jobs:
           target: ${{ matrix.target }}
           manylinux: auto
           working-directory: nasl-py
-          args: --release --out dist --find-interpreter
+          args: --release --out dist
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -47,7 +47,7 @@ jobs:
         with:
           target: ${{ matrix.target }}
           working-directory: nasl-py
-          args: --release --out dist --find-interpreter
+          args: --release --out dist
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -65,7 +65,7 @@ jobs:
         with:
           target: x86_64
           working-directory: nasl-py
-          args: --release --out dist --find-interpreter
+          args: --release --out dist
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
