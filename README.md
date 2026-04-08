@@ -9,7 +9,7 @@ Built on [Rowan](https://github.com/rust-analyzer/rowan) (the same CST library u
 ## Contents
 
 - [Architecture](#architecture)
-- [Build & Install](#build--install)
+- [Install](#install)
 - [Python API — NaslFile](#python-api--naslfile)
   - [Constructors & I/O](#constructors--io)
   - [script\_tag](#script_tag)
@@ -56,14 +56,37 @@ nasl-tools/
 
 ---
 
-## Build & Install
+## Install
 
-Requirements: Rust (stable), Python 3.8+, [maturin](https://github.com/PyO3/maturin).
+Download the pre-built wheel for your platform from the
+[latest release](https://github.com/mikekei/nasl-tools/releases/latest) and install it:
 
 ```bash
-cd ~/nasl-tools/nasl-py
+pip install https://github.com/mikekei/nasl-tools/releases/latest/download/nasl_py-0.1.0-cp312-cp312-manylinux_2_34_x86_64.whl
+```
+
+Wheels are available for:
+
+| Platform | File suffix |
+|---|---|
+| Linux x86\_64 | `manylinux_2_34_x86_64` |
+| Linux aarch64 | `manylinux_2_34_aarch64` |
+| macOS x86\_64 | `macosx_..._x86_64` |
+| macOS arm64 | `macosx_..._arm64` |
+| Windows x86\_64 | `win_amd64` |
+
+Pick the file that matches your OS and Python version from the
+[releases page](https://github.com/mikekei/nasl-tools/releases).
+
+### Build from source
+
+Requires Rust (stable), Python 3.8+, and [maturin](https://github.com/PyO3/maturin).
+
+```bash
+git clone https://github.com/mikekei/nasl-tools.git
+cd nasl-tools/nasl-py
 maturin build --release
-pip install --force-reinstall ~/nasl-tools/target/wheels/nasl_py-*.whl
+pip install ../target/wheels/nasl_py-*.whl
 ```
 
 ---
