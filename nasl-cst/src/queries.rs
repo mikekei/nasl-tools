@@ -152,7 +152,14 @@ fn add_positional_string_arg(
             replacement: format!("{}\"{}\"", prefix, value),
         });
     }
-    None
+    // No existing call — insert a new statement before exit(0)
+    let exit_stmt = find_description_exit(root)?;
+    let indent = detect_indent(&exit_stmt);
+    let insert_at = exit_stmt.text_range().start();
+    Some(Edit {
+        range: TextRange::new(insert_at, insert_at),
+        replacement: format!("{}(\"{}\")\n{}", fn_name, value, indent),
+    })
 }
 
 /// Find the exit(0) EXPR_STMT inside the if(description){} block.
@@ -783,11 +790,20 @@ pub fn has_include(root: &SyntaxNode, filename: &str) -> bool {
 /// Append `include("filename");` after the last existing include statement.
 pub fn add_include(root: &SyntaxNode, filename: &str) -> Option<Edit> {
     let stmts = nodes_of_kind(root, SyntaxKind::INCLUDE_STMT);
-    let last = stmts.last()?;
-    let insert_at = last.text_range().end();
+    if let Some(last) = stmts.last() {
+        let insert_at = last.text_range().end();
+        return Some(Edit {
+            range: TextRange::new(insert_at, insert_at),
+            replacement: format!("\ninclude(\"{}\");", filename),
+        });
+    }
+    // No existing include — insert before exit(0)
+    let exit_stmt = find_description_exit(root)?;
+    let indent = detect_indent(&exit_stmt);
+    let insert_at = exit_stmt.text_range().start();
     Some(Edit {
         range: TextRange::new(insert_at, insert_at),
-        replacement: format!("\ninclude(\"{}\");", filename),
+        replacement: format!("include(\"{}\")\n{}", filename, indent),
     })
 }
 
@@ -1154,7 +1170,7 @@ pub fn parse_nasl_date(s: &str) -> Option<NaslDate> {
     let year: i32 = d[0].parse().ok()?;
     let month: u8 = d[1].parse().ok()?;
     let day: u8 = d[2].parse().ok()?;
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+    if year < 1900 || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
         return None;
     }
 
@@ -1247,17 +1263,14 @@ pub struct AssignmentInfo {
 
 /// All CALL_EXPR nodes whose leading IDENT_EXPR has text == `fn_name`.
 fn find_call_nodes(root: &SyntaxNode, fn_name: &str) -> Vec<SyntaxNode> {
-    nodes_of_kind(root, SyntaxKind::CALL_EXPR)
+    // The NASL CST has no CALL_EXPR kind. A call is represented as an
+    // IDENT_EXPR followed by an ARG_LIST as siblings inside the parent node.
+    // Find all ARG_LIST nodes whose parent has an IDENT_EXPR sibling with the
+    // right name, then return those parents (the containing statement/block).
+    nodes_of_kind(root, SyntaxKind::ARG_LIST)
         .into_iter()
-        .filter(|call| {
-            call.children().any(|child| {
-                child.kind() == SyntaxKind::IDENT_EXPR
-                    && child
-                        .descendants_with_tokens()
-                        .filter_map(|e| e.into_token())
-                        .any(|t| t.kind() == SyntaxKind::IDENT && t.text() == fn_name)
-            })
-        })
+        .filter(|arg_list| parent_fn_is(arg_list.clone(), fn_name))
+        .filter_map(|arg_list| arg_list.parent())
         .collect()
 }
 
@@ -1342,6 +1355,10 @@ fn replace_named_arg_value_edit(na: &SyntaxNode, new_value: &str) -> Option<Edit
 /// Walk up the parent chain to find the enclosing EXPR_STMT.
 /// Returns `None` if the call is inside a condition or other non-statement context.
 fn expr_stmt_ancestor(node: &SyntaxNode) -> Option<SyntaxNode> {
+    // Check the node itself first (find_call_nodes already returns EXPR_STMTs).
+    if node.kind() == SyntaxKind::EXPR_STMT {
+        return Some(node.clone());
+    }
     let mut cur = node.parent();
     while let Some(n) = cur {
         match n.kind() {
@@ -1569,11 +1586,14 @@ pub fn insert_at_end_of_if_block(root: &SyntaxNode, fn_name: &str, stmt: &str) -
 /// Handles `=`, `+=`, `-=`, `*=`, `/=`, `%=`. Only simple `ident = expr`
 /// left-hand sides are matched (not array subscripts).
 pub fn find_assignments(root: &SyntaxNode, var_name: &str) -> Vec<AssignmentInfo> {
-    nodes_of_kind(root, SyntaxKind::ASSIGN_EXPR)
+    // The NASL CST has no ASSIGN_EXPR kind. Assignments are EXPR_STMT nodes
+    // whose first child IDENT_EXPR matches the variable name and that contain
+    // an assignment operator token as a direct child.
+    nodes_of_kind(root, SyntaxKind::EXPR_STMT)
         .into_iter()
-        .filter_map(|assign| {
+        .filter_map(|stmt| {
             // LHS must be a bare IDENT_EXPR with the target name
-            let lhs = assign.children().next()?;
+            let lhs = stmt.children().next()?;
             if lhs.kind() != SyntaxKind::IDENT_EXPR {
                 return None;
             }
@@ -1585,16 +1605,16 @@ pub fn find_assignments(root: &SyntaxNode, var_name: &str) -> Vec<AssignmentInfo
                 return None;
             }
 
-            let (op_tok, rhs_start) = assign_op_and_rhs(&assign)?;
-            let full = assign.text().to_string();
-            let rhs_off: usize = (rhs_start - assign.text_range().start()).into();
-            let value = full[rhs_off..].trim().to_string();
+            let (op_tok, rhs_start) = assign_op_and_rhs(&stmt)?;
+            let full = stmt.text().to_string();
+            let rhs_off: usize = (rhs_start - stmt.text_range().start()).into();
+            let value = full[rhs_off..].trim().trim_end_matches(';').trim().to_string();
 
             Some(AssignmentInfo {
                 var_name: var_name.to_string(),
                 operator: op_tok.text().to_string(),
                 value,
-                offset: u32::from(assign.text_range().start()),
+                offset: u32::from(stmt.text_range().start()),
             })
         })
         .collect()
@@ -1602,8 +1622,8 @@ pub fn find_assignments(root: &SyntaxNode, var_name: &str) -> Vec<AssignmentInfo
 
 /// Replace the RHS of the **first** assignment to `var_name` with `new_expr`.
 pub fn replace_assignment(root: &SyntaxNode, var_name: &str, new_expr: &str) -> Option<Edit> {
-    for assign in nodes_of_kind(root, SyntaxKind::ASSIGN_EXPR) {
-        let lhs = match assign.children().next() {
+    for stmt in nodes_of_kind(root, SyntaxKind::EXPR_STMT) {
+        let lhs = match stmt.children().next() {
             Some(n) => n,
             None => continue,
         };
@@ -1617,9 +1637,16 @@ pub fn replace_assignment(root: &SyntaxNode, var_name: &str, new_expr: &str) -> 
         if !matches {
             continue;
         }
-        if let Some((_, rhs_start)) = assign_op_and_rhs(&assign) {
+        if let Some((_, rhs_start)) = assign_op_and_rhs(&stmt) {
+            // Replace from rhs_start to just before the trailing SEMICOLON
+            let end = stmt
+                .children_with_tokens()
+                .filter_map(|e| e.into_token())
+                .find(|t| t.kind() == SyntaxKind::SEMICOLON)
+                .map(|t| t.text_range().start())
+                .unwrap_or_else(|| stmt.text_range().end());
             return Some(Edit {
-                range: TextRange::new(rhs_start, assign.text_range().end()),
+                range: TextRange::new(rhs_start, end),
                 replacement: new_expr.to_string(),
             });
         }
