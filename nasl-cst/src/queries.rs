@@ -21,7 +21,11 @@ pub fn parent_fn_is(arg_list: SyntaxNode, name: &str) -> bool {
             && child
                 .descendants_with_tokens()
                 .filter_map(|e| e.into_token())
-                .any(|t| t.kind() == SyntaxKind::IDENT && t.text() == name)
+                // Match both regular identifiers and NASL keyword-calls (e.g. exit → KW_EXIT)
+                .any(|t| {
+                    matches!(t.kind(), SyntaxKind::IDENT | SyntaxKind::KW_EXIT)
+                        && t.text() == name
+                })
     })
 }
 

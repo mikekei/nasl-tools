@@ -7,11 +7,15 @@ Run:
     pytest tests/stress_test.py -v
     pytest tests/stress_test.py -v -k "round_trip"   # one class only
 
+Integration tests against a real plugin directory (classes 21–22):
+    NASL_PLUGIN_DIR=/path/to/NVT-plugins pytest tests/stress_test.py -v -k "Integration"
+
 Requires nasl_py installed:
     pip install ...  (see README) or maturin develop in nasl-py/
 """
 import os
 import pathlib
+import subprocess
 import tempfile
 
 import pytest
@@ -1890,3 +1894,283 @@ if(description)
             tokens = list(all_tokens(tree))
             for i in range(1, len(tokens)):
                 assert tokens[i]["offset"] >= tokens[i-1]["offset"]
+
+
+# ============================================================================
+# 21. Exit(0) remove → restore round-trip
+#
+# Verifies that:
+#   1. find_calls("exit") locates all exit statements
+#   2. Removing them (reverse offset order) and writing produces a file with
+#      no exit calls
+#   3. Re-inserting them at the original offsets (forward order) and writing
+#      restores the source byte-for-byte
+# ============================================================================
+
+# Source with multiple exits (one in description, two in code body)
+MULTI_EXIT = """\
+if(description)
+{
+  script_oid("1.3.6.1.4.1.25623.1.0.199001");
+  script_version("2024-01-01T00:00:00+0000");
+  script_name("Multi Exit");
+  script_family("General");
+  script_copyright("(C) 2024 Test");
+  script_category(ACT_GATHER_INFO);
+  script_tag(name:"cvss_base", value:"5.0");
+  exit(0);
+}
+port = get_http_port(default:80);
+if(!port) exit(0);
+res = http_get(item:"/", port:port);
+if(!res) exit(1);
+"""
+
+
+class TestExitRemoveRestore:
+    """Round-trip: remove all exit() calls then restore them exactly."""
+
+    def _exit_calls(self, src):
+        """Return exit call info sorted by offset ascending."""
+        f = load(src)
+        calls = f.find_calls("exit")
+        # Each call dict has 'text', 'offset', 'args'
+        return sorted(calls, key=lambda c: c["offset"])
+
+    @pytest.mark.parametrize("src", DESCRIPTION_FIXTURES + [MULTI_EXIT])
+    def test_exit_remove_restore_roundtrip(self, src):
+        """Remove all exits then restore them — result must equal original."""
+        original = src
+        exits = self._exit_calls(src)
+        if not exits:
+            pytest.skip("fixture has no exit() calls")
+
+        # ── Phase 1: remove exits in reverse offset order ─────────────────
+        f = load(src)
+        for call in reversed(exits):
+            offset = call["offset"]
+            length = len(call["text"].encode("utf-8"))
+            f.replace_range(offset, length, "")
+
+        no_exits_str = f.to_str()
+
+        # Verify: no exit calls remain
+        f_check = load(no_exits_str)
+        remaining = f_check.find_calls("exit")
+        assert remaining == [], (
+            f"Expected no exit calls after removal, found: {remaining}"
+        )
+
+        # ── Phase 2: restore exits in forward offset order ────────────────
+        # When removing in reverse order, the bytes before each exit are
+        # untouched, so original offsets are valid insertion points in
+        # no_exits_str. Inserting in forward order restores offsets for
+        # subsequent exits as each insertion adds back the removed bytes.
+        f2 = load(no_exits_str)
+        for call in exits:
+            f2.replace_range(call["offset"], 0, call["text"])
+
+        restored = f2.to_str()
+        assert restored == original, (
+            "Restored source does not match original.\n"
+            f"Original ({len(original)} chars) vs restored ({len(restored)} chars)"
+        )
+
+    def test_exits_found_in_multi_exit_fixture(self):
+        exits = self._exit_calls(MULTI_EXIT)
+        assert len(exits) == 3, f"Expected 3 exits in MULTI_EXIT, found {len(exits)}"
+
+    def test_no_exit_fixture_skipped(self):
+        # BARE_CODE has no description block exit
+        exits = self._exit_calls(BARE_CODE)
+        # bare code has no exit(0) in description, may have none
+        assert isinstance(exits, list)
+
+    def test_round_trip_tabs_fixture(self):
+        src = TABS
+        exits = self._exit_calls(src)
+        assert len(exits) >= 1
+        f = load(src)
+        for call in reversed(exits):
+            f.replace_range(call["offset"], len(call["text"].encode("utf-8")), "")
+        no_exits = f.to_str()
+        f2 = load(no_exits)
+        for call in exits:
+            f2.replace_range(call["offset"], 0, call["text"])
+        assert f2.to_str() == src
+
+    def test_round_trip_crlf_fixture(self):
+        src = CRLF
+        exits = self._exit_calls(src)
+        assert len(exits) >= 1
+        f = load(src)
+        for call in reversed(exits):
+            f.replace_range(call["offset"], len(call["text"].encode("utf-8")), "")
+        no_exits = f.to_str()
+        f2 = load(no_exits)
+        for call in exits:
+            f2.replace_range(call["offset"], 0, call["text"])
+        assert f2.to_str() == src
+
+
+# ============================================================================
+# 22. Integration: round-trip on real plugin directory
+#
+# Reads NASL_PLUGIN_DIR from environment. Skipped if not set.
+# Tests on a sample of files (NASL_RT_SAMPLE, default 500).
+#
+# Tests:
+#   A. summary tag add/revert → git diff clean
+#   B. exit(0) remove/restore on sampled files → content round-trips
+# ============================================================================
+
+_PLUGIN_DIR = os.environ.get("NASL_PLUGIN_DIR", "")
+_SAMPLE_SIZE = int(os.environ.get("NASL_RT_SAMPLE", "500"))
+_SKIP_INTEGRATION = not _PLUGIN_DIR or not pathlib.Path(_PLUGIN_DIR).is_dir()
+
+
+def _sample_nasl_files(directory: str, n: int):
+    """Return up to n evenly-spaced .nasl files from directory."""
+    files = sorted(pathlib.Path(directory).rglob("*.nasl"))
+    if not files:
+        return []
+    step = max(1, len(files) // n)
+    return files[::step][:n]
+
+
+def _is_utf8(path: pathlib.Path) -> bool:
+    try:
+        path.read_bytes().decode("utf-8")
+        return True
+    except (UnicodeDecodeError, OSError):
+        return False
+
+
+@pytest.mark.skipif(_SKIP_INTEGRATION, reason="NASL_PLUGIN_DIR not set or not a directory")
+class TestIntegrationRoundTrip:
+    """Real-file integration tests. Set NASL_PLUGIN_DIR to enable."""
+
+    @pytest.fixture(scope="class")
+    def sampled_files(self):
+        files = _sample_nasl_files(_PLUGIN_DIR, _SAMPLE_SIZE)
+        # Only UTF-8 files (a handful of legacy files use Latin-1)
+        return [f for f in files if _is_utf8(f)]
+
+    # ── A. summary tag add/revert ─────────────────────────────────────────
+
+    def test_summary_tag_roundtrip_git_clean(self, sampled_files):
+        """
+        For each file that has a summary tag:
+          1. Read → update summary → write
+          2. Read → revert summary → write
+          3. Assert git diff is clean for those files.
+        """
+        MARKER = " [NASL_RT_TEST]"
+        touched = []
+
+        for path in sampled_files:
+            try:
+                src = path.read_text(encoding="utf-8")
+                f = nasl_py.NaslFile.from_str(src)
+                val = f.get_script_tag("summary")
+                if val is None or MARKER in val:
+                    continue
+                f.set_script_tag("summary", val + MARKER)
+                path.write_text(f.to_str(), encoding="utf-8")
+                touched.append(path)
+            except Exception:
+                pass
+
+        assert touched, "No files with summary tags found in sample"
+
+        # Verify: git sees exactly the files we touched
+        git_dirty = subprocess.run(
+            ["git", "diff", "--name-only"],
+            cwd=_PLUGIN_DIR, capture_output=True, text=True
+        ).stdout.splitlines()
+        assert len(git_dirty) == len(touched), (
+            f"Git dirty count {len(git_dirty)} != touched count {len(touched)}"
+        )
+
+        # Spot-check: only the marker line changed
+        rel = touched[0].relative_to(_PLUGIN_DIR)
+        diff = subprocess.run(
+            ["git", "diff", str(rel)],
+            cwd=_PLUGIN_DIR, capture_output=True, text=True
+        ).stdout
+        assert MARKER in diff, "Marker not visible in git diff"
+        added = [l for l in diff.splitlines() if l.startswith("+") and not l.startswith("+++")]
+        removed = [l for l in diff.splitlines() if l.startswith("-") and not l.startswith("---")]
+        assert len(added) <= 2 and len(removed) <= 2, (
+            f"More than one line changed in spot-check file:\n{diff[:500]}"
+        )
+
+        # Revert
+        for path in touched:
+            try:
+                src = path.read_text(encoding="utf-8")
+                f = nasl_py.NaslFile.from_str(src)
+                val = f.get_script_tag("summary")
+                if val and val.endswith(MARKER):
+                    f.set_script_tag("summary", val[:-len(MARKER)])
+                path.write_text(f.to_str(), encoding="utf-8")
+            except Exception:
+                pass
+
+        # Verify: clean
+        git_dirty_after = subprocess.run(
+            ["git", "diff", "--name-only"],
+            cwd=_PLUGIN_DIR, capture_output=True, text=True
+        ).stdout.splitlines()
+        dirty = [l for l in git_dirty_after if l]
+        assert not dirty, (
+            f"Git not clean after revert. Still dirty: {dirty[:5]}"
+        )
+
+    # ── B. exit(0) remove/restore ─────────────────────────────────────────
+
+    def test_exit_remove_restore_on_real_files(self, sampled_files):
+        """
+        For each sampled file:
+          1. Find all exit() calls
+          2. Remove them (reverse offset order)
+          3. Restore them (forward offset order)
+          4. Assert restored content == original
+        """
+        checked = 0
+        failures = []
+
+        for path in sampled_files:
+            try:
+                original = path.read_text(encoding="utf-8")
+                f = load(original)
+                exits = sorted(f.find_calls("exit"), key=lambda c: c["offset"])
+                if not exits:
+                    continue
+
+                # Remove in reverse order
+                for call in reversed(exits):
+                    f.replace_range(call["offset"],
+                                    len(call["text"].encode("utf-8")), "")
+
+                no_exits = f.to_str()
+
+                # Restore in forward order
+                f2 = load(no_exits)
+                for call in exits:
+                    f2.replace_range(call["offset"], 0, call["text"])
+
+                restored = f2.to_str()
+                if restored != original:
+                    failures.append(
+                        f"{path.name}: {len(original)} vs {len(restored)} chars"
+                    )
+                checked += 1
+            except Exception as e:
+                failures.append(f"{path.name}: exception {e}")
+
+        assert checked > 0, "No files with exit() calls found in sample"
+        assert not failures, (
+            f"{len(failures)} files failed exit round-trip:\n" +
+            "\n".join(failures[:10])
+        )
