@@ -1,2 +1,3 @@
 target/
 nasl-cst/target/
+tests/__pycache__/
