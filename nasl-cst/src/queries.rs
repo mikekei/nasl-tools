@@ -1201,3 +1201,548 @@ pub fn version_is_after(root: &SyntaxNode, cutoff: &NaslDate) -> bool {
 pub fn version_is_between(root: &SyntaxNode, start: &NaslDate, end: &NaslDate) -> bool {
     get_version_date(root).map_or(false, |d| d >= *start && d <= *end)
 }
+
+// ============================================================================
+// General code block operations
+// ============================================================================
+
+/// A resolved function call site anywhere in the file.
+#[derive(Debug, Clone)]
+pub struct CallSite {
+    /// Full source text of the call expression, e.g. `foo("bar", x:1)`.
+    pub text: String,
+    /// Byte offset of the call's start in the source.
+    pub offset: u32,
+    /// Positional argument texts (trimmed; strings are unquoted).
+    pub args: Vec<String>,
+    /// Named argument `(name, value_text)` pairs.
+    pub named_args: Vec<(String, String)>,
+}
+
+/// A located if-statement.
+#[derive(Debug, Clone)]
+pub struct IfBlockInfo {
+    /// Condition text between the outer `(` and `)` (trimmed).
+    pub condition: String,
+    /// Full source text of the entire if-statement.
+    pub text: String,
+    /// Byte offset of the `if` keyword.
+    pub offset: u32,
+}
+
+/// A located variable assignment.
+#[derive(Debug, Clone)]
+pub struct AssignmentInfo {
+    /// Variable name on the left-hand side.
+    pub var_name: String,
+    /// Assignment operator (`=`, `+=`, `-=`, `*=`, `/=`, `%=`).
+    pub operator: String,
+    /// Source text of the right-hand side expression (trimmed).
+    pub value: String,
+    /// Byte offset of the assignment expression.
+    pub offset: u32,
+}
+
+// ── Private helpers ───────────────────────────────────────────────────────────
+
+/// All CALL_EXPR nodes whose leading IDENT_EXPR has text == `fn_name`.
+fn find_call_nodes(root: &SyntaxNode, fn_name: &str) -> Vec<SyntaxNode> {
+    nodes_of_kind(root, SyntaxKind::CALL_EXPR)
+        .into_iter()
+        .filter(|call| {
+            call.children().any(|child| {
+                child.kind() == SyntaxKind::IDENT_EXPR
+                    && child
+                        .descendants_with_tokens()
+                        .filter_map(|e| e.into_token())
+                        .any(|t| t.kind() == SyntaxKind::IDENT && t.text() == fn_name)
+            })
+        })
+        .collect()
+}
+
+/// Build a [`CallSite`] snapshot from a CALL_EXPR node.
+fn call_site_from_node(call: &SyntaxNode) -> CallSite {
+    let (args, named_args) = call
+        .children()
+        .find(|n| n.kind() == SyntaxKind::ARG_LIST)
+        .map(|al| {
+            let pos: Vec<String> = al
+                .children()
+                .filter(|n| n.kind() == SyntaxKind::ARG)
+                .map(|n| n.text().to_string().trim().to_string())
+                .collect();
+            let named: Vec<(String, String)> = al
+                .children()
+                .filter(|n| n.kind() == SyntaxKind::NAMED_ARG)
+                .filter_map(|n| Some((na_ident(&n)?, named_arg_value_expr_text(&n)?)))
+                .collect();
+            (pos, named)
+        })
+        .unwrap_or_default();
+
+    CallSite {
+        text: call.text().to_string(),
+        offset: u32::from(call.text_range().start()),
+        args,
+        named_args,
+    }
+}
+
+/// Text of an IF_STMT's condition — the content between the outer `(` and `)`.
+fn if_stmt_condition_text(if_stmt: &SyntaxNode) -> String {
+    let mut inside = false;
+    let mut text = String::new();
+    for child in if_stmt.children_with_tokens() {
+        match child.kind() {
+            SyntaxKind::L_PAREN if !inside => inside = true,
+            SyntaxKind::R_PAREN | SyntaxKind::BLOCK if inside => break,
+            _ if inside => {
+                if let Some(t) = child.as_token() {
+                    text.push_str(t.text());
+                } else if let Some(n) = child.as_node() {
+                    text.push_str(&n.text().to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    text.trim().to_string()
+}
+
+/// Replace the value portion of a NAMED_ARG (from after `:` to end of node).
+fn replace_named_arg_value_edit(na: &SyntaxNode, new_value: &str) -> Option<Edit> {
+    let mut past_colon = false;
+    let mut expr_start: Option<TextSize> = None;
+    let na_end = na.text_range().end();
+
+    for elem in na.children_with_tokens() {
+        if past_colon {
+            if let Some(t) = elem.as_token() {
+                if t.kind() == SyntaxKind::WHITESPACE {
+                    continue;
+                }
+            }
+            expr_start = Some(elem.text_range().start());
+            break;
+        }
+        if let Some(t) = elem.as_token() {
+            if t.kind() == SyntaxKind::COLON {
+                past_colon = true;
+            }
+        }
+    }
+
+    expr_start.map(|start| Edit {
+        range: TextRange::new(start, na_end),
+        replacement: new_value.to_string(),
+    })
+}
+
+/// Walk up the parent chain to find the enclosing EXPR_STMT.
+/// Returns `None` if the call is inside a condition or other non-statement context.
+fn expr_stmt_ancestor(node: &SyntaxNode) -> Option<SyntaxNode> {
+    let mut cur = node.parent();
+    while let Some(n) = cur {
+        match n.kind() {
+            SyntaxKind::EXPR_STMT => return Some(n),
+            // Control-flow nodes that own conditions — call is not a standalone stmt
+            SyntaxKind::SOURCE_FILE
+            | SyntaxKind::FUNCTION_DEF
+            | SyntaxKind::IF_STMT
+            | SyntaxKind::FOR_STMT
+            | SyntaxKind::FOREACH_STMT
+            | SyntaxKind::WHILE_STMT
+            | SyntaxKind::REPEAT_STMT => return None,
+            _ => {}
+        }
+        cur = n.parent();
+    }
+    None
+}
+
+/// Shared logic for extracting `(op_tok, rhs_start)` from an ASSIGN_EXPR.
+fn assign_op_and_rhs(assign: &SyntaxNode) -> Option<(SyntaxToken, TextSize)> {
+    let op_tok = assign
+        .children_with_tokens()
+        .filter_map(|e| e.into_token())
+        .find(|t| {
+            matches!(
+                t.kind(),
+                SyntaxKind::EQ
+                    | SyntaxKind::PLUS_EQ
+                    | SyntaxKind::MINUS_EQ
+                    | SyntaxKind::STAR_EQ
+                    | SyntaxKind::SLASH_EQ
+                    | SyntaxKind::PERCENT_EQ
+            )
+        })?;
+
+    let op_range = op_tok.text_range();
+    let mut past = false;
+    let mut rhs_start = None;
+    for elem in assign.children_with_tokens() {
+        if past {
+            if let Some(t) = elem.as_token() {
+                if t.kind() == SyntaxKind::WHITESPACE {
+                    continue;
+                }
+            }
+            rhs_start = Some(elem.text_range().start());
+            break;
+        }
+        if let Some(t) = elem.as_token() {
+            if t.text_range() == op_range {
+                past = true;
+            }
+        }
+    }
+    Some((op_tok, rhs_start?))
+}
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+/// Return all call sites of `fn_name` anywhere in the file.
+pub fn find_calls(root: &SyntaxNode, fn_name: &str) -> Vec<CallSite> {
+    find_call_nodes(root, fn_name)
+        .iter()
+        .map(call_site_from_node)
+        .collect()
+}
+
+/// Replace a positional argument in the `occurrence`-th call to `fn_name`.
+///
+/// Both `occurrence` and `arg_index` are 0-based.
+/// Returns `None` if the call or arg is not found.
+pub fn replace_call_positional_arg(
+    root: &SyntaxNode,
+    fn_name: &str,
+    occurrence: usize,
+    arg_index: usize,
+    new_value: &str,
+) -> Option<Edit> {
+    let call = find_call_nodes(root, fn_name).into_iter().nth(occurrence)?;
+    let arg_list = call.children().find(|n| n.kind() == SyntaxKind::ARG_LIST)?;
+    let arg = arg_list
+        .children()
+        .filter(|n| n.kind() == SyntaxKind::ARG)
+        .nth(arg_index)?;
+    Some(Edit {
+        range: arg.text_range(),
+        replacement: new_value.to_string(),
+    })
+}
+
+/// Replace the value of named argument `arg_name` in every call to `fn_name`.
+///
+/// Returns one `Edit` per matched call. Pass all to `apply_edits`.
+pub fn replace_call_named_arg(
+    root: &SyntaxNode,
+    fn_name: &str,
+    arg_name: &str,
+    new_value: &str,
+) -> Vec<Edit> {
+    find_call_nodes(root, fn_name)
+        .iter()
+        .filter_map(|call| {
+            let al = call.children().find(|n| n.kind() == SyntaxKind::ARG_LIST)?;
+            let na = al
+                .children()
+                .filter(|n| n.kind() == SyntaxKind::NAMED_ARG)
+                .find(|n| na_ident(n).as_deref() == Some(arg_name))?;
+            replace_named_arg_value_edit(&na, new_value)
+        })
+        .collect()
+}
+
+/// All if-blocks whose condition or body contains a call to `fn_name`.
+pub fn find_if_blocks_with_call(root: &SyntaxNode, fn_name: &str) -> Vec<IfBlockInfo> {
+    nodes_of_kind(root, SyntaxKind::IF_STMT)
+        .into_iter()
+        .filter(|if_stmt| contains_call(if_stmt, fn_name))
+        .map(|if_stmt| IfBlockInfo {
+            condition: if_stmt_condition_text(&if_stmt),
+            text: if_stmt.text().to_string(),
+            offset: u32::from(if_stmt.text_range().start()),
+        })
+        .collect()
+}
+
+/// All if-blocks whose condition text contains `substr` (substring match).
+pub fn find_if_blocks_with_condition_text(root: &SyntaxNode, substr: &str) -> Vec<IfBlockInfo> {
+    nodes_of_kind(root, SyntaxKind::IF_STMT)
+        .into_iter()
+        .filter_map(|if_stmt| {
+            let cond = if_stmt_condition_text(&if_stmt);
+            if cond.contains(substr) {
+                Some(IfBlockInfo {
+                    condition: cond,
+                    text: if_stmt.text().to_string(),
+                    offset: u32::from(if_stmt.text_range().start()),
+                })
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Insert `stmt` as a new statement immediately before every standalone call to `fn_name`.
+///
+/// "Standalone" means the call is an EXPR_STMT, not inside a condition or RHS.
+/// Returns one `Edit` per matched site; pass all to `apply_edits`.
+pub fn insert_before_call(root: &SyntaxNode, fn_name: &str, stmt: &str) -> Vec<Edit> {
+    find_call_nodes(root, fn_name)
+        .into_iter()
+        .filter_map(|call| {
+            let expr_stmt = expr_stmt_ancestor(&call)?;
+            let indent = detect_indent(&expr_stmt);
+            let insert_at = expr_stmt.text_range().start();
+            Some(Edit {
+                range: TextRange::new(insert_at, insert_at),
+                replacement: format!("\n{}{}", indent, stmt),
+            })
+        })
+        .collect()
+}
+
+/// Insert `stmt` as a new statement immediately after every standalone call to `fn_name`.
+pub fn insert_after_call(root: &SyntaxNode, fn_name: &str, stmt: &str) -> Vec<Edit> {
+    find_call_nodes(root, fn_name)
+        .into_iter()
+        .filter_map(|call| {
+            let expr_stmt = expr_stmt_ancestor(&call)?;
+            let indent = detect_indent(&expr_stmt);
+            let insert_at = expr_stmt.text_range().end();
+            Some(Edit {
+                range: TextRange::new(insert_at, insert_at),
+                replacement: format!("\n{}{}", indent, stmt),
+            })
+        })
+        .collect()
+}
+
+/// Insert `stmt` at the start (after `{`) of every if-block that calls `fn_name`.
+pub fn insert_at_start_of_if_block(root: &SyntaxNode, fn_name: &str, stmt: &str) -> Vec<Edit> {
+    nodes_of_kind(root, SyntaxKind::IF_STMT)
+        .into_iter()
+        .filter(|if_stmt| contains_call(if_stmt, fn_name))
+        .filter_map(|if_stmt| {
+            let block = if_stmt.children().find(|n| n.kind() == SyntaxKind::BLOCK)?;
+            let lbrace = block
+                .children_with_tokens()
+                .filter_map(|e| e.into_token())
+                .find(|t| t.kind() == SyntaxKind::L_BRACE)?;
+            let indent = detect_block_stmt_indent(&block);
+            let insert_at = lbrace.text_range().end();
+            Some(Edit {
+                range: TextRange::new(insert_at, insert_at),
+                replacement: format!("\n{}{}", indent, stmt),
+            })
+        })
+        .collect()
+}
+
+/// Insert `stmt` at the end (before `}`) of every if-block that calls `fn_name`.
+pub fn insert_at_end_of_if_block(root: &SyntaxNode, fn_name: &str, stmt: &str) -> Vec<Edit> {
+    nodes_of_kind(root, SyntaxKind::IF_STMT)
+        .into_iter()
+        .filter(|if_stmt| contains_call(if_stmt, fn_name))
+        .filter_map(|if_stmt| {
+            let block = if_stmt.children().find(|n| n.kind() == SyntaxKind::BLOCK)?;
+            let indent = detect_block_stmt_indent(&block);
+            let rbrace = block
+                .children_with_tokens()
+                .filter_map(|e| e.into_token())
+                .find(|t| t.kind() == SyntaxKind::R_BRACE)?;
+            let insert_at = rbrace.text_range().start();
+            Some(Edit {
+                range: TextRange::new(insert_at, insert_at),
+                replacement: format!("{}{}\n", indent, stmt),
+            })
+        })
+        .collect()
+}
+
+/// All assignments to `var_name` anywhere in the file.
+///
+/// Handles `=`, `+=`, `-=`, `*=`, `/=`, `%=`. Only simple `ident = expr`
+/// left-hand sides are matched (not array subscripts).
+pub fn find_assignments(root: &SyntaxNode, var_name: &str) -> Vec<AssignmentInfo> {
+    nodes_of_kind(root, SyntaxKind::ASSIGN_EXPR)
+        .into_iter()
+        .filter_map(|assign| {
+            // LHS must be a bare IDENT_EXPR with the target name
+            let lhs = assign.children().next()?;
+            if lhs.kind() != SyntaxKind::IDENT_EXPR {
+                return None;
+            }
+            let ident = lhs
+                .descendants_with_tokens()
+                .filter_map(|e| e.into_token())
+                .find(|t| t.kind() == SyntaxKind::IDENT)?;
+            if ident.text() != var_name {
+                return None;
+            }
+
+            let (op_tok, rhs_start) = assign_op_and_rhs(&assign)?;
+            let full = assign.text().to_string();
+            let rhs_off: usize = (rhs_start - assign.text_range().start()).into();
+            let value = full[rhs_off..].trim().to_string();
+
+            Some(AssignmentInfo {
+                var_name: var_name.to_string(),
+                operator: op_tok.text().to_string(),
+                value,
+                offset: u32::from(assign.text_range().start()),
+            })
+        })
+        .collect()
+}
+
+/// Replace the RHS of the **first** assignment to `var_name` with `new_expr`.
+pub fn replace_assignment(root: &SyntaxNode, var_name: &str, new_expr: &str) -> Option<Edit> {
+    for assign in nodes_of_kind(root, SyntaxKind::ASSIGN_EXPR) {
+        let lhs = match assign.children().next() {
+            Some(n) => n,
+            None => continue,
+        };
+        if lhs.kind() != SyntaxKind::IDENT_EXPR {
+            continue;
+        }
+        let matches = lhs
+            .descendants_with_tokens()
+            .filter_map(|e| e.into_token())
+            .any(|t| t.kind() == SyntaxKind::IDENT && t.text() == var_name);
+        if !matches {
+            continue;
+        }
+        if let Some((_, rhs_start)) = assign_op_and_rhs(&assign) {
+            return Some(Edit {
+                range: TextRange::new(rhs_start, assign.text_range().end()),
+                replacement: new_expr.to_string(),
+            });
+        }
+    }
+    None
+}
+
+// ============================================================================
+// Full tree access
+// ============================================================================
+
+/// A node or token in the CST, suitable for Python-side manual traversal.
+///
+/// Obtain via [`get_tree`], walk `children`, then use `offset` + `length`
+/// with [`replace_range_edit`] to target any edit precisely.
+#[derive(Debug, Clone)]
+pub struct TreeNode {
+    /// `SyntaxKind` name (e.g. `"IF_STMT"`, `"IDENT"`, `"STRING_DOUBLE"`).
+    pub kind: String,
+    /// Byte offset of this node/token in the source.
+    pub offset: u32,
+    /// Byte length of this node/token.
+    pub length: u32,
+    /// `true` for leaf tokens, `false` for composite nodes.
+    pub is_token: bool,
+    /// Raw source text — only set when `is_token == true`.
+    pub text: Option<String>,
+    /// Child nodes and tokens — only non-empty when `is_token == false`.
+    pub children: Vec<TreeNode>,
+}
+
+fn build_tree_node(node: &SyntaxNode) -> TreeNode {
+    let children = node
+        .children_with_tokens()
+        .map(|child| {
+            if let Some(t) = child.as_token() {
+                TreeNode {
+                    kind: format!("{:?}", t.kind()),
+                    offset: u32::from(t.text_range().start()),
+                    length: u32::from(t.text_range().len()),
+                    is_token: true,
+                    text: Some(t.text().to_string()),
+                    children: Vec::new(),
+                }
+            } else {
+                build_tree_node(child.as_node().unwrap())
+            }
+        })
+        .collect();
+
+    TreeNode {
+        kind: format!("{:?}", node.kind()),
+        offset: u32::from(node.text_range().start()),
+        length: u32::from(node.text_range().len()),
+        is_token: false,
+        text: None,
+        children,
+    }
+}
+
+/// Return the entire CST as a [`TreeNode`] tree rooted at `root`.
+///
+/// Walk `children` recursively. Leaf tokens carry `text`, `offset`, and
+/// `length`. Use `offset` + `length` with [`replace_range_edit`] to build
+/// an edit for any node or token you find.
+pub fn get_tree(root: &SyntaxNode) -> TreeNode {
+    build_tree_node(root)
+}
+
+/// Build an [`Edit`] that replaces `length` bytes starting at `offset`.
+///
+/// Pair this with offsets from [`get_tree`] for arbitrary structural edits.
+pub fn replace_range_edit(offset: u32, length: u32, replacement: &str) -> Edit {
+    Edit {
+        range: TextRange::new(TextSize::from(offset), TextSize::from(offset + length)),
+        replacement: replacement.to_string(),
+    }
+}
+
+// ============================================================================
+// Comment operations
+// ============================================================================
+
+/// A located comment token.
+#[derive(Debug, Clone)]
+pub struct CommentInfo {
+    /// Full comment text including the leading `#`.
+    pub text: String,
+    /// Byte offset of this comment token in the source.
+    pub offset: u32,
+}
+
+/// All comment tokens in the file, in source order.
+pub fn get_comments(root: &SyntaxNode) -> Vec<CommentInfo> {
+    root.descendants_with_tokens()
+        .filter_map(|e| e.into_token())
+        .filter(|t| t.kind() == SyntaxKind::COMMENT)
+        .map(|t| CommentInfo {
+            text: t.text().to_string(),
+            offset: u32::from(t.text_range().start()),
+        })
+        .collect()
+}
+
+/// All comment tokens whose text contains `substr` (case-sensitive).
+pub fn find_comments_containing(root: &SyntaxNode, substr: &str) -> Vec<CommentInfo> {
+    get_comments(root)
+        .into_iter()
+        .filter(|c| c.text.contains(substr))
+        .collect()
+}
+
+/// Replace the comment token at byte `offset` with `new_text`.
+///
+/// `new_text` must include the leading `#` (e.g. `"# revised comment"`).
+/// Returns `None` if no comment starts at `offset`.
+pub fn replace_comment_at(root: &SyntaxNode, offset: u32, new_text: &str) -> Option<Edit> {
+    let target = TextSize::from(offset);
+    root.descendants_with_tokens()
+        .filter_map(|e| e.into_token())
+        .find(|t| t.kind() == SyntaxKind::COMMENT && t.text_range().start() == target)
+        .map(|t| Edit {
+            range: t.text_range(),
+            replacement: new_text.to_string(),
+        })
+}

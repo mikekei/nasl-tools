@@ -29,6 +29,24 @@ fn write_nasl(path: &std::path::Path, content: &str) -> bool {
     std::fs::write(path, content.as_bytes()).is_ok()
 }
 
+/// Convert a [`TreeNode`] to a nested Python dict recursively.
+fn tree_node_to_py<'py>(py: Python<'py>, node: TreeNode) -> Bound<'py, PyDict> {
+    let d = PyDict::new_bound(py);
+    let _ = d.set_item("kind", &node.kind);
+    let _ = d.set_item("offset", node.offset);
+    let _ = d.set_item("length", node.length);
+    let _ = d.set_item("is_token", node.is_token);
+    if let Some(ref text) = node.text {
+        let _ = d.set_item("text", text);
+    }
+    let children = PyList::empty_bound(py);
+    for child in node.children {
+        let _ = children.append(tree_node_to_py(py, child));
+    }
+    let _ = d.set_item("children", children);
+    d
+}
+
 /// Apply one optional edit and return new source. If no edit, return original.
 fn apply_one(source: &str, edit: Option<Edit>) -> String {
     match edit {
@@ -526,6 +544,151 @@ impl NaslFile {
         if e.is_some() { self.current = apply_one(&self.current, e); true } else { false }
     }
 
+    // ── General code block operations ────────────────────────────────────────
+
+    /// Return all call sites of `fn_name` as a list of dicts:
+    /// `{text, offset, args: [str], named_args: {name: value}}`.
+    fn find_calls<'py>(&self, py: Python<'py>, fn_name: &str) -> Vec<Bound<'py, PyDict>> {
+        let r = parse(&self.current);
+        find_calls(&r.root, fn_name)
+            .into_iter()
+            .map(|cs| {
+                let d = PyDict::new_bound(py);
+                let _ = d.set_item("text", &cs.text);
+                let _ = d.set_item("offset", cs.offset);
+                let _ = d.set_item("args", cs.args);
+                let na = PyDict::new_bound(py);
+                for (k, v) in cs.named_args { let _ = na.set_item(k, v); }
+                let _ = d.set_item("named_args", na);
+                d
+            })
+            .collect()
+    }
+
+    /// Replace a positional argument in the `occurrence`-th call to `fn_name`.
+    ///
+    /// `occurrence` and `arg_index` are both 0-based.
+    /// Returns `True` if the edit was applied.
+    fn replace_call_positional_arg(
+        &mut self,
+        fn_name: &str,
+        occurrence: usize,
+        arg_index: usize,
+        new_value: &str,
+    ) -> bool {
+        let r = parse(&self.current);
+        let e = replace_call_positional_arg(&r.root, fn_name, occurrence, arg_index, new_value);
+        if e.is_some() { self.current = apply_one(&self.current, e); true } else { false }
+    }
+
+    /// Replace the value of named argument `arg_name` in every call to `fn_name`.
+    ///
+    /// Returns the number of call sites updated.
+    fn replace_call_named_arg(&mut self, fn_name: &str, arg_name: &str, new_value: &str) -> usize {
+        let r = parse(&self.current);
+        let edits = replace_call_named_arg(&r.root, fn_name, arg_name, new_value);
+        let count = edits.len();
+        if count > 0 { self.current = apply_edits(&self.current, edits); }
+        count
+    }
+
+    /// All if-blocks whose condition or body calls `fn_name`.
+    /// Returns list of `{condition, text, offset}` dicts.
+    fn find_if_blocks_with_call<'py>(&self, py: Python<'py>, fn_name: &str) -> Vec<Bound<'py, PyDict>> {
+        let r = parse(&self.current);
+        find_if_blocks_with_call(&r.root, fn_name)
+            .into_iter()
+            .map(|b| {
+                let d = PyDict::new_bound(py);
+                let _ = d.set_item("condition", b.condition);
+                let _ = d.set_item("text", b.text);
+                let _ = d.set_item("offset", b.offset);
+                d
+            })
+            .collect()
+    }
+
+    /// All if-blocks whose condition contains `substr` (substring match).
+    /// Returns list of `{condition, text, offset}` dicts.
+    fn find_if_blocks_with_condition_text<'py>(&self, py: Python<'py>, substr: &str) -> Vec<Bound<'py, PyDict>> {
+        let r = parse(&self.current);
+        find_if_blocks_with_condition_text(&r.root, substr)
+            .into_iter()
+            .map(|b| {
+                let d = PyDict::new_bound(py);
+                let _ = d.set_item("condition", b.condition);
+                let _ = d.set_item("text", b.text);
+                let _ = d.set_item("offset", b.offset);
+                d
+            })
+            .collect()
+    }
+
+    /// Insert `stmt` before every standalone call to `fn_name`.
+    /// Returns the number of sites modified.
+    fn insert_before_call(&mut self, fn_name: &str, stmt: &str) -> usize {
+        let r = parse(&self.current);
+        let edits = insert_before_call(&r.root, fn_name, stmt);
+        let count = edits.len();
+        if count > 0 { self.current = apply_edits(&self.current, edits); }
+        count
+    }
+
+    /// Insert `stmt` after every standalone call to `fn_name`.
+    /// Returns the number of sites modified.
+    fn insert_after_call(&mut self, fn_name: &str, stmt: &str) -> usize {
+        let r = parse(&self.current);
+        let edits = insert_after_call(&r.root, fn_name, stmt);
+        let count = edits.len();
+        if count > 0 { self.current = apply_edits(&self.current, edits); }
+        count
+    }
+
+    /// Insert `stmt` at the start (after `{`) of every if-block calling `fn_name`.
+    /// Returns the number of blocks modified.
+    fn insert_at_start_of_if_block(&mut self, fn_name: &str, stmt: &str) -> usize {
+        let r = parse(&self.current);
+        let edits = insert_at_start_of_if_block(&r.root, fn_name, stmt);
+        let count = edits.len();
+        if count > 0 { self.current = apply_edits(&self.current, edits); }
+        count
+    }
+
+    /// Insert `stmt` at the end (before `}`) of every if-block calling `fn_name`.
+    /// Returns the number of blocks modified.
+    fn insert_at_end_of_if_block(&mut self, fn_name: &str, stmt: &str) -> usize {
+        let r = parse(&self.current);
+        let edits = insert_at_end_of_if_block(&r.root, fn_name, stmt);
+        let count = edits.len();
+        if count > 0 { self.current = apply_edits(&self.current, edits); }
+        count
+    }
+
+    /// All assignments to `var_name`.
+    /// Returns list of `{var_name, operator, value, offset}` dicts.
+    fn find_assignments<'py>(&self, py: Python<'py>, var_name: &str) -> Vec<Bound<'py, PyDict>> {
+        let r = parse(&self.current);
+        find_assignments(&r.root, var_name)
+            .into_iter()
+            .map(|a| {
+                let d = PyDict::new_bound(py);
+                let _ = d.set_item("var_name", a.var_name);
+                let _ = d.set_item("operator", a.operator);
+                let _ = d.set_item("value", a.value);
+                let _ = d.set_item("offset", a.offset);
+                d
+            })
+            .collect()
+    }
+
+    /// Replace the RHS of the first assignment to `var_name` with `new_expr`.
+    /// Returns `True` if updated.
+    fn replace_assignment(&mut self, var_name: &str, new_expr: &str) -> bool {
+        let r = parse(&self.current);
+        let e = replace_assignment(&r.root, var_name, new_expr);
+        if e.is_some() { self.current = apply_one(&self.current, e); true } else { false }
+    }
+
     // ── Date queries ─────────────────────────────────────────────────────────
 
     /// Parse and return the `script_version(...)` string as an ISO 8601
@@ -558,6 +721,71 @@ impl NaslFile {
         let e = match parse_nasl_date(end) { Some(d) => d, None => return false };
         let r = parse(&self.current);
         version_is_between(&r.root, &s, &e)
+    }
+
+    // ── Full tree access ─────────────────────────────────────────────────────
+
+    /// Return the entire CST as a nested Python dict tree.
+    ///
+    /// Each node: `{kind, offset, length, is_token: False, children: [...]}`
+    /// Each token: `{kind, offset, length, is_token: True, text: str}`
+    ///
+    /// Walk `children` to find any node or token, then pass its `offset` and
+    /// `length` to `replace_range()` to make a precise edit.
+    fn get_tree<'py>(&self, py: Python<'py>) -> Bound<'py, PyDict> {
+        let r = parse(&self.current);
+        tree_node_to_py(py, get_tree(&r.root))
+    }
+
+    /// Replace `length` bytes starting at `offset` with `new_text`.
+    ///
+    /// Use offsets from `get_tree()` to target any node or token precisely.
+    fn replace_range(&mut self, offset: u32, length: u32, new_text: &str) -> bool {
+        let edit = replace_range_edit(offset, length, new_text);
+        self.current = apply_edits(&self.current, vec![edit]);
+        true
+    }
+
+    // ── Comment operations ────────────────────────────────────────────────────
+
+    /// All comment tokens in source order.
+    /// Returns list of `{text, offset}` dicts.
+    fn get_comments<'py>(&self, py: Python<'py>) -> Vec<Bound<'py, PyDict>> {
+        let r = parse(&self.current);
+        get_comments(&r.root)
+            .into_iter()
+            .map(|c| {
+                let d = PyDict::new_bound(py);
+                let _ = d.set_item("text", c.text);
+                let _ = d.set_item("offset", c.offset);
+                d
+            })
+            .collect()
+    }
+
+    /// Comments whose text contains `substr` (case-sensitive).
+    /// Returns list of `{text, offset}` dicts.
+    fn find_comments_containing<'py>(&self, py: Python<'py>, substr: &str) -> Vec<Bound<'py, PyDict>> {
+        let r = parse(&self.current);
+        find_comments_containing(&r.root, substr)
+            .into_iter()
+            .map(|c| {
+                let d = PyDict::new_bound(py);
+                let _ = d.set_item("text", c.text);
+                let _ = d.set_item("offset", c.offset);
+                d
+            })
+            .collect()
+    }
+
+    /// Replace the comment at byte `offset` with `new_text`.
+    ///
+    /// `new_text` must include the leading `#`, e.g. `"# updated"`.
+    /// Returns `True` if a comment was found and replaced.
+    fn replace_comment(&mut self, offset: u32, new_text: &str) -> bool {
+        let r = parse(&self.current);
+        let e = replace_comment_at(&r.root, offset, new_text);
+        if e.is_some() { self.current = apply_one(&self.current, e); true } else { false }
     }
 
     // ── Repr ─────────────────────────────────────────────────────────────────
@@ -821,6 +1049,49 @@ fn tag_value_stats<'py>(py: Python<'py>, directory: &str, tag_name: &str) -> Bou
 }
 
 // ============================================================================
+// Code block search functions (directory-level)
+// ============================================================================
+
+/// Return all .nasl files that contain at least one comment with `substr`.
+#[pyfunction]
+fn find_files_with_comment(directory: &str, substr: &str) -> Vec<String> {
+    walk_nasl(directory)
+        .filter(|p| {
+            read_nasl(p)
+                .map(|src| !find_comments_containing(&parse(&src).root, substr).is_empty())
+                .unwrap_or(false)
+        })
+        .map(|p| p.display().to_string())
+        .collect()
+}
+
+/// Return all .nasl files that contain at least one call to `fn_name`.
+#[pyfunction]
+fn find_files_with_call(directory: &str, fn_name: &str) -> Vec<String> {
+    walk_nasl(directory)
+        .filter(|p| {
+            read_nasl(p)
+                .map(|src| !find_calls(&parse(&src).root, fn_name).is_empty())
+                .unwrap_or(false)
+        })
+        .map(|p| p.display().to_string())
+        .collect()
+}
+
+/// Return all .nasl files that contain at least one assignment to `var_name`.
+#[pyfunction]
+fn find_files_with_assignment(directory: &str, var_name: &str) -> Vec<String> {
+    walk_nasl(directory)
+        .filter(|p| {
+            read_nasl(p)
+                .map(|src| !find_assignments(&parse(&src).root, var_name).is_empty())
+                .unwrap_or(false)
+        })
+        .map(|p| p.display().to_string())
+        .collect()
+}
+
+// ============================================================================
 // Date-based search functions
 // ============================================================================
 
@@ -907,6 +1178,11 @@ fn nasl_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(family_stats, m)?)?;
     m.add_function(wrap_pyfunction!(category_stats, m)?)?;
     m.add_function(wrap_pyfunction!(tag_value_stats, m)?)?;
+
+    // Code block search
+    m.add_function(wrap_pyfunction!(find_files_with_comment, m)?)?;
+    m.add_function(wrap_pyfunction!(find_files_with_call, m)?)?;
+    m.add_function(wrap_pyfunction!(find_files_with_assignment, m)?)?;
 
     // Date-based search
     m.add_function(wrap_pyfunction!(find_files_with_version_before, m)?)?;
