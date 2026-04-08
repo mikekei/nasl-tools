@@ -526,6 +526,40 @@ impl NaslFile {
         if e.is_some() { self.current = apply_one(&self.current, e); true } else { false }
     }
 
+    // ── Date queries ─────────────────────────────────────────────────────────
+
+    /// Parse and return the `script_version(...)` string as an ISO 8601
+    /// date string `"YYYY-MM-DDTHH:MM:SS"`. Returns `None` if absent or
+    /// unparseable.
+    fn get_version_date(&self) -> Option<String> {
+        let r = parse(&self.current);
+        get_version_date(&r.root).map(|d| d.to_iso_string())
+    }
+
+    /// `True` if `script_version` date is strictly before `date_str`.
+    ///
+    /// `date_str` accepts `"YYYY-MM-DD"` or `"YYYY-MM-DDTHH:MM:SS[+offset]"`.
+    fn version_before(&self, date_str: &str) -> bool {
+        let cutoff = match parse_nasl_date(date_str) { Some(d) => d, None => return false };
+        let r = parse(&self.current);
+        version_is_before(&r.root, &cutoff)
+    }
+
+    /// `True` if `script_version` date is strictly after `date_str`.
+    fn version_after(&self, date_str: &str) -> bool {
+        let cutoff = match parse_nasl_date(date_str) { Some(d) => d, None => return false };
+        let r = parse(&self.current);
+        version_is_after(&r.root, &cutoff)
+    }
+
+    /// `True` if `script_version` date is within `[start, end]` inclusive.
+    fn version_between(&self, start: &str, end: &str) -> bool {
+        let s = match parse_nasl_date(start) { Some(d) => d, None => return false };
+        let e = match parse_nasl_date(end) { Some(d) => d, None => return false };
+        let r = parse(&self.current);
+        version_is_between(&r.root, &s, &e)
+    }
+
     // ── Repr ─────────────────────────────────────────────────────────────────
 
     fn __repr__(&self) -> String {
@@ -787,6 +821,62 @@ fn tag_value_stats<'py>(py: Python<'py>, directory: &str, tag_name: &str) -> Bou
 }
 
 // ============================================================================
+// Date-based search functions
+// ============================================================================
+
+/// Return all .nasl files whose `script_version` date is strictly before `date_str`.
+///
+/// `date_str` accepts `"YYYY-MM-DD"` or `"YYYY-MM-DDTHH:MM:SS[+offset]"`.
+#[pyfunction]
+fn find_files_with_version_before(directory: &str, date_str: &str) -> Vec<String> {
+    let cutoff = match parse_nasl_date(date_str) {
+        Some(d) => d,
+        None => return Vec::new(),
+    };
+    walk_nasl(directory)
+        .filter(|p| {
+            read_nasl(p)
+                .map(|src| version_is_before(&parse(&src).root, &cutoff))
+                .unwrap_or(false)
+        })
+        .map(|p| p.display().to_string())
+        .collect()
+}
+
+/// Return all .nasl files whose `script_version` date is strictly after `date_str`.
+#[pyfunction]
+fn find_files_with_version_after(directory: &str, date_str: &str) -> Vec<String> {
+    let cutoff = match parse_nasl_date(date_str) {
+        Some(d) => d,
+        None => return Vec::new(),
+    };
+    walk_nasl(directory)
+        .filter(|p| {
+            read_nasl(p)
+                .map(|src| version_is_after(&parse(&src).root, &cutoff))
+                .unwrap_or(false)
+        })
+        .map(|p| p.display().to_string())
+        .collect()
+}
+
+/// Return all .nasl files whose `script_version` date falls within
+/// `[start, end]` inclusive.
+#[pyfunction]
+fn find_files_with_version_between(directory: &str, start: &str, end: &str) -> Vec<String> {
+    let s = match parse_nasl_date(start) { Some(d) => d, None => return Vec::new() };
+    let e = match parse_nasl_date(end) { Some(d) => d, None => return Vec::new() };
+    walk_nasl(directory)
+        .filter(|p| {
+            read_nasl(p)
+                .map(|src| version_is_between(&parse(&src).root, &s, &e))
+                .unwrap_or(false)
+        })
+        .map(|p| p.display().to_string())
+        .collect()
+}
+
+// ============================================================================
 // Module
 // ============================================================================
 
@@ -817,6 +907,11 @@ fn nasl_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(family_stats, m)?)?;
     m.add_function(wrap_pyfunction!(category_stats, m)?)?;
     m.add_function(wrap_pyfunction!(tag_value_stats, m)?)?;
+
+    // Date-based search
+    m.add_function(wrap_pyfunction!(find_files_with_version_before, m)?)?;
+    m.add_function(wrap_pyfunction!(find_files_with_version_after, m)?)?;
+    m.add_function(wrap_pyfunction!(find_files_with_version_between, m)?)?;
 
     Ok(())
 }

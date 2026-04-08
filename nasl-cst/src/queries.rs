@@ -1099,3 +1099,105 @@ pub fn update_pci_kb_item(root: &SyntaxNode, key: &str, value_expr: &str) -> Opt
     }
     None
 }
+
+// ============================================================================
+// Date parsing and comparison
+// ============================================================================
+
+/// A parsed NASL script version date.
+///
+/// Derives `Ord` so dates are directly comparable with `<`, `>`, etc.
+/// The version string format is typically `"2025-04-08T12:00:00+0000"`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct NaslDate {
+    pub year: i32,
+    pub month: u8,
+    pub day: u8,
+    pub hour: u8,
+    pub minute: u8,
+    pub second: u8,
+}
+
+impl NaslDate {
+    /// Returns the date as an ISO 8601 string `"YYYY-MM-DDTHH:MM:SS"`.
+    pub fn to_iso_string(&self) -> String {
+        format!(
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
+            self.year, self.month, self.day, self.hour, self.minute, self.second
+        )
+    }
+}
+
+/// Parse a NASL version/date string into a [`NaslDate`].
+///
+/// Accepts:
+/// - `"2025-04-08T12:00:00+0000"` — full timestamp (timezone stripped)
+/// - `"2025-04-08T12:00:00+00:00"` — with colon in timezone
+/// - `"2025-04-08"` — date only (time set to 00:00:00)
+/// - `"2025/04/08"` — slash-separated date
+///
+/// Returns `None` if the string cannot be parsed.
+pub fn parse_nasl_date(s: &str) -> Option<NaslDate> {
+    let s = s.trim();
+
+    // Split on 'T' to separate date and optional time
+    let (date_part, time_part) = match s.find('T') {
+        Some(i) => (&s[..i], Some(&s[i + 1..])),
+        None => (s, None),
+    };
+
+    // Parse YYYY-MM-DD or YYYY/MM/DD
+    let d: Vec<&str> = date_part.splitn(3, |c| c == '-' || c == '/').collect();
+    if d.len() < 3 {
+        return None;
+    }
+    let year: i32 = d[0].parse().ok()?;
+    let month: u8 = d[1].parse().ok()?;
+    let day: u8 = d[2].parse().ok()?;
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+
+    // Parse HH:MM:SS from time part (ignore timezone offset)
+    let (hour, minute, second) = if let Some(t) = time_part {
+        // Take at most 8 chars ("HH:MM:SS") — any trailing +0000 is beyond that
+        let t8 = &t[..t.len().min(8)];
+        let parts: Vec<&str> = t8.splitn(3, ':').collect();
+        let h: u8 = parts.first().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let m: u8 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+        // Seconds field may have a trailing sign char if timestamp is short
+        let sec: u8 = parts
+            .get(2)
+            .map(|s| s.chars().take_while(|c| c.is_ascii_digit()).collect::<String>())
+            .as_deref()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        (h, m, sec)
+    } else {
+        (0, 0, 0)
+    };
+
+    Some(NaslDate { year, month, day, hour, minute, second })
+}
+
+/// Extract and parse the `script_version(...)` string as a [`NaslDate`].
+/// Returns `None` if the call is absent or unparseable.
+pub fn get_version_date(root: &SyntaxNode) -> Option<NaslDate> {
+    let v = get_simple_call(root, "script_version")?;
+    parse_nasl_date(&v)
+}
+
+/// `true` if the file's version date is strictly before `cutoff`.
+pub fn version_is_before(root: &SyntaxNode, cutoff: &NaslDate) -> bool {
+    get_version_date(root).map_or(false, |d| d < *cutoff)
+}
+
+/// `true` if the file's version date is strictly after `cutoff`.
+pub fn version_is_after(root: &SyntaxNode, cutoff: &NaslDate) -> bool {
+    get_version_date(root).map_or(false, |d| d > *cutoff)
+}
+
+/// `true` if the file's version date is within `[start, end]` inclusive.
+pub fn version_is_between(root: &SyntaxNode, start: &NaslDate, end: &NaslDate) -> bool {
+    get_version_date(root).map_or(false, |d| d >= *start && d <= *end)
+}
