@@ -343,6 +343,109 @@ f.update_pci_kb_item("holm/pci/xss", "get_script_oid()")  # → bool
 
 ---
 
+### NaslFile — general code block operations
+
+Operate on any function call, if-block, or variable assignment anywhere in the file body (not just the description block).
+
+```python
+# ── Find calls ──────────────────────────────────────────────────────────────
+# Returns list of {text, offset, args: [str], named_args: {name: value}}
+f.find_calls("http_send_recv")
+f.find_calls("get_kb_item")
+
+# ── Update call arguments ────────────────────────────────────────────────────
+# Replace positional arg (occurrence=0-based call index, arg_index=0-based)
+f.replace_call_positional_arg("script_oid", 0, 0, '"1.3.6.1.4.1.25623.1.0.99999"')  # → bool
+
+# Replace named arg value in ALL calls to that function
+count = f.replace_call_named_arg("http_send_recv", "port", "port2")   # → int
+
+# ── Find if-blocks ───────────────────────────────────────────────────────────
+# Returns list of {condition, text, offset}
+f.find_if_blocks_with_call("security_message")      # blocks that call fn
+f.find_if_blocks_with_condition_text("get_kb_item") # blocks where condition contains substr
+
+# ── Insert statements ────────────────────────────────────────────────────────
+# Only targets standalone call statements (not calls inside conditions/RHS)
+count = f.insert_before_call("security_message", 'log_message(data:"triggered");')
+count = f.insert_after_call("security_message", 'set_kb_item(name:"foo", value:1);')
+
+# Insert at start/end of if-blocks that call fn_name
+count = f.insert_at_start_of_if_block("security_message", 'local_var port;')
+count = f.insert_at_end_of_if_block("security_message", 'log_message(data:"done");')
+# All insert functions return the number of sites modified
+
+# ── Variable assignments ─────────────────────────────────────────────────────
+# Returns list of {var_name, operator, value, offset}
+f.find_assignments("port")           # finds: port = ..., port += ..., etc.
+f.replace_assignment("port", "443")  # → bool (replaces first match)
+```
+
+---
+
+### NaslFile — full tree access
+
+Exposes the entire CST for manual traversal. Use when the higher-level helpers don't cover your case.
+
+```python
+# Returns nested dict tree:
+# Node: {kind: str, offset: int, length: int, is_token: False, children: [...]}
+# Token: {kind: str, offset: int, length: int, is_token: True, text: str}
+tree = f.get_tree()
+
+# Walk helper
+def find_nodes(node, kind):
+    if node["kind"] == kind:
+        yield node
+    for child in node.get("children", []):
+        yield from find_nodes(child, kind)
+
+# Edit by offset + length — replaces any byte range precisely
+f.replace_range(offset, length, "replacement text")   # → bool
+
+# Full pattern: find → inspect → replace
+for node in find_nodes(tree, "STRING_DOUBLE"):
+    if node["text"] == '"old_value"':
+        f.replace_range(node["offset"], node["length"], '"new_value"')
+
+# Available SyntaxKind names (common ones):
+# Tokens:  IDENT, INT_LIT, STRING_DOUBLE, STRING_SINGLE, COMMENT
+#          KW_IF, KW_FOR, KW_FUNCTION, KW_RETURN, KW_LOCAL_VAR
+#          EQ, PLUS_EQ, EQ_EQ, LT, GT, AMP_AMP, PIPE_PIPE, BANG
+# Nodes:   SOURCE_FILE, FUNCTION_DEF, BLOCK, EXPR_STMT
+#          IF_STMT, FOR_STMT, FOREACH_STMT, WHILE_STMT
+#          CALL_EXPR, ARG_LIST, ARG, NAMED_ARG, ASSIGN_EXPR
+#          BINARY_EXPR, UNARY_EXPR, IDENT_EXPR, LITERAL
+```
+
+---
+
+### NaslFile — comment operations
+
+```python
+# All comments in source order — list of {text, offset}
+f.get_comments()
+
+# Filter by substring (case-sensitive)
+f.find_comments_containing("holm")      # → [{text, offset}, ...]
+f.find_comments_containing("TODO")
+
+# Replace a specific comment by its byte offset
+# new_text must include the leading #
+for c in f.find_comments_containing("old text"):
+    f.replace_comment(c["offset"], "# new text")
+
+f.to_file(path)
+```
+
+Module-level search:
+```python
+nasl_py.find_files_with_comment(DIR, "TODO")
+nasl_py.find_files_with_comment(DIR, "holm")
+```
+
+---
+
 ### Module-level — batch edits
 
 All return `(total_files, edited_files, errors: list[str])`.
@@ -368,6 +471,7 @@ nasl_py.batch_remove_cve_id(DIR, "CVE-2023-1234")
 ### Module-level — search (return list of matching file paths)
 
 ```python
+# Metadata searches
 nasl_py.find_files_with_cve(DIR, "CVE-2023-44487")
 nasl_py.find_files_with_tag(DIR, "solution_type", "WillNotFix")
 nasl_py.find_files_missing_tag(DIR, "epss_score")
@@ -376,6 +480,16 @@ nasl_py.find_files_with_include(DIR, "http_func.inc")
 nasl_py.find_files_with_dependency(DIR, "smb_reg_service.nasl")
 nasl_py.find_files_with_holm_marker(DIR)
 nasl_py.find_files_with_pci_key(DIR, "holm/pci/xss")
+
+# Code body searches
+nasl_py.find_files_with_call(DIR, "http_send_recv")      # any call to fn_name
+nasl_py.find_files_with_assignment(DIR, "port")          # any assignment to var
+nasl_py.find_files_with_comment(DIR, "TODO")             # comment containing substr
+
+# Version date searches
+nasl_py.find_files_with_version_before(DIR, "2024-01-01")
+nasl_py.find_files_with_version_after(DIR, "2025-01-01")
+nasl_py.find_files_with_version_between(DIR, "2024-01-01", "2024-12-31")
 ```
 
 ---
@@ -564,6 +678,95 @@ for path in nasl_py.find_files_with_version_after(DIR, "2020-01-01"):
         counts[d[:7]] += 1   # "YYYY-MM"
 for ym, n in sorted(counts.items()):
     print(f"  {ym}  {n:>6}")
+```
+
+### Code block operations
+
+```python
+# Find all files that call a specific function, then inspect the call sites
+files = nasl_py.find_files_with_call(DIR, "http_send_recv")
+for path in files[:10]:
+    f = nasl_py.NaslFile.from_file(path)
+    for call in f.find_calls("http_send_recv"):
+        print(f"  offset={call['offset']}  args={call['args']}  named={call['named_args']}")
+
+# Replace a named arg across all calls in a file
+f = nasl_py.NaslFile.from_file(path)
+count = f.replace_call_named_arg("http_send_recv", "port", "port2")
+if count:
+    f.to_file(path)
+    print(f"Updated {count} call(s)")
+
+# Insert a log statement after every security_message call in a file
+f = nasl_py.NaslFile.from_file(path)
+n = f.insert_after_call("security_message", 'log_message(data:"reported");')
+if n:
+    f.to_file(path)
+
+# Find all if-blocks whose condition checks a KB item
+for blk in f.find_if_blocks_with_condition_text("get_kb_item"):
+    print(f"  cond: {blk['condition'][:80]}")
+
+# Find and fix a variable assignment
+for a in f.find_assignments("timeout"):
+    print(f"  {a['var_name']} {a['operator']} {a['value']}  @offset {a['offset']}")
+f.replace_assignment("timeout", "30")
+f.to_file(path)
+```
+
+### Tree traversal and raw range edits
+
+```python
+f = nasl_py.NaslFile.from_file(path)
+tree = f.get_tree()
+
+# Generic walker
+def walk(node, fn, depth=0):
+    fn(node, depth)
+    for child in node.get("children", []):
+        walk(child, fn, depth + 1)
+
+# Print all IDENT tokens
+def print_idents(node, depth):
+    if node["is_token"] and node["kind"] == "IDENT":
+        print("  " * depth + node["text"])
+walk(tree, print_idents)
+
+# Find all string literals and print them with offsets
+def find_strings(node, depth):
+    if node["is_token"] and node["kind"] in ("STRING_DOUBLE", "STRING_SINGLE"):
+        print(f"  [{node['offset']}:{node['length']}] {node['text']}")
+walk(tree, find_strings)
+
+# Replace any specific token by its offset
+for node in (n for n in _all_tokens(tree) if n["text"] == '"old_host"'):
+    f.replace_range(node["offset"], node["length"], '"new_host"')
+f.to_file(path)
+```
+
+### Comment operations
+
+```python
+# List all comments in a file
+f = nasl_py.NaslFile.from_file(path)
+for c in f.get_comments():
+    print(f"  [{c['offset']}] {c['text']}")
+
+# Find and update a specific comment
+for c in f.find_comments_containing("FIXME"):
+    f.replace_comment(c["offset"], "# resolved")
+
+# Find all files with a specific comment pattern
+files = nasl_py.find_files_with_comment(DIR, "CVE-2023")
+print(f"{len(files)} files have CVE-2023 in comments")
+
+# Batch: remove TODO comments across all files
+for path in nasl_py.find_files_with_comment(DIR, "TODO"):
+    f = nasl_py.NaslFile.from_file(path)
+    for c in f.find_comments_containing("TODO"):
+        f.replace_comment(c["offset"], "#")
+    if f.is_modified():
+        f.to_file(path)
 ```
 
 ### Statistics overview

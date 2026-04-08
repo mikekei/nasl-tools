@@ -24,6 +24,9 @@ Built on [Rowan](https://github.com/rust-analyzer/rowan) (the same CST library u
   - [Holm modification markers](#holm-modification-markers)
   - [Recursive dependency resolution](#recursive-dependency-resolution)
   - [Security message blocks & PCI KB items](#security-message-blocks--pci-kb-items)
+  - [General code block operations](#general-code-block-operations)
+  - [Full tree access](#full-tree-access)
+  - [Comment operations](#comment-operations)
 - [Python API — Module-level functions](#python-api--module-level-functions)
   - [Batch edits](#batch-edits)
   - [Search / find](#search--find)
@@ -381,6 +384,161 @@ f.update_pci_kb_item("holm/pci/xss", "TRUE")   # → bool
 
 ---
 
+### General code block operations
+
+Operate on any function call, if-block, or variable assignment anywhere in the file — not just the description block.
+
+#### Finding calls
+
+```python
+# Returns list of {text, offset, args, named_args} for every call to fn_name
+calls = f.find_calls("http_send_recv")
+# calls[0] == {
+#   "text": 'http_send_recv(socket:soc, data:req)',
+#   "offset": 4820,
+#   "args": [],
+#   "named_args": {"socket": "soc", "data": "req"}
+# }
+
+calls = f.find_calls("get_kb_item")
+```
+
+#### Updating call arguments
+
+```python
+# Replace a positional argument (occurrence=0-based, arg_index=0-based)
+f.replace_call_positional_arg("script_oid", 0, 0, '"1.3.6.1.4.1.25623.1.0.99999"')  # → bool
+
+# Replace a named argument across every call to fn_name in the file
+count = f.replace_call_named_arg("http_send_recv", "port", "port2")   # → int (sites updated)
+```
+
+#### Finding if-blocks
+
+```python
+# Returns list of {condition, text, offset}
+blocks = f.find_if_blocks_with_call("security_message")
+blocks = f.find_if_blocks_with_condition_text("get_kb_item")
+```
+
+`find_if_blocks_with_call` matches blocks whose **condition or body** calls the function.
+`find_if_blocks_with_condition_text` matches blocks where the **condition string** contains the substring.
+
+#### Inserting statements
+
+All insert functions return the number of sites modified and only target standalone call-statement positions (not calls inside conditions or RHS expressions).
+
+```python
+# Insert a statement before/after every standalone call to fn_name
+count = f.insert_before_call("security_message", 'log_message(data:"triggered");')
+count = f.insert_after_call("security_message",  'set_kb_item(name:"x", value:1);')
+
+# Insert at start (after {) or end (before }) of if-blocks that call fn_name
+count = f.insert_at_start_of_if_block("security_message", 'local_var report;')
+count = f.insert_at_end_of_if_block("security_message",   'log_message(data:"done");')
+```
+
+#### Variable assignments
+
+```python
+# Returns list of {var_name, operator, value, offset}
+# Handles =  +=  -=  *=  /=  %=   (simple ident LHS only)
+assignments = f.find_assignments("port")
+# [{"var_name": "port", "operator": "=", "value": "443", "offset": 6120}, ...]
+
+# Replace the RHS of the first matching assignment
+f.replace_assignment("port", "get_kb_item(\"Services/www\")")   # → bool
+```
+
+---
+
+### Full tree access
+
+When the higher-level helpers don't cover your case, expose the raw CST.
+
+```python
+tree = f.get_tree()
+```
+
+The returned dict structure is:
+
+```
+# Inner node:
+{"kind": "IF_STMT", "offset": 1234, "length": 89, "is_token": False, "children": [...]}
+
+# Leaf token:
+{"kind": "STRING_DOUBLE", "offset": 1240, "length": 7, "is_token": True, "text": '"hello"'}
+```
+
+Walk `children` recursively to find any node or token. Then use `offset` + `length` with `replace_range()` to make a precise edit.
+
+```python
+# Generic walker
+def walk(node, fn):
+    fn(node)
+    for child in node.get("children", []):
+        walk(child, fn)
+
+# Example: find all IDENT tokens
+idents = []
+walk(tree, lambda n: idents.append(n["text"]) if n.get("is_token") and n["kind"] == "IDENT" else None)
+
+# Replace any byte range directly (use offsets from get_tree)
+f.replace_range(offset, length, "replacement text")   # → bool (always True)
+
+# Workflow: find a specific string literal and replace it
+def find_tokens(node, kind):
+    if node.get("is_token") and node["kind"] == kind:
+        yield node
+    for child in node.get("children", []):
+        yield from find_tokens(child, kind)
+
+for tok in find_tokens(tree, "STRING_DOUBLE"):
+    if tok["text"] == '"old_value"':
+        f.replace_range(tok["offset"], tok["length"], '"new_value"')
+
+f.to_file(path)
+```
+
+**Common `kind` values:**
+
+| Category | Kinds |
+|---|---|
+| Identifiers & literals | `IDENT`, `INT_LIT`, `HEX_LIT`, `STRING_DOUBLE`, `STRING_SINGLE` |
+| Keywords | `KW_IF`, `KW_FOR`, `KW_FOREACH`, `KW_WHILE`, `KW_FUNCTION`, `KW_RETURN`, `KW_LOCAL_VAR`, `KW_GLOBAL_VAR` |
+| Operators | `EQ`, `PLUS_EQ`, `EQ_EQ`, `BANG_EQ`, `LT`, `GT`, `AMP_AMP`, `PIPE_PIPE`, `BANG` |
+| Trivia | `WHITESPACE`, `NEWLINE`, `COMMENT` |
+| Statements | `EXPR_STMT`, `IF_STMT`, `FOR_STMT`, `FOREACH_STMT`, `WHILE_STMT`, `RETURN_STMT`, `FUNCTION_DEF` |
+| Expressions | `CALL_EXPR`, `ASSIGN_EXPR`, `BINARY_EXPR`, `UNARY_EXPR`, `IDENT_EXPR`, `LITERAL` |
+| Call parts | `ARG_LIST`, `ARG`, `NAMED_ARG` |
+| Structure | `SOURCE_FILE`, `BLOCK`, `PARAM_LIST` |
+
+---
+
+### Comment operations
+
+```python
+# All comments in source order — list of {text, offset}
+comments = f.get_comments()
+# [{"text": "# This is a comment", "offset": 42}, ...]
+
+# Filter by substring (case-sensitive)
+matches = f.find_comments_containing("holm")
+matches = f.find_comments_containing("TODO")
+
+# Replace a comment at a specific byte offset
+# new_text must include the leading #
+f.replace_comment(offset, "# revised comment")   # → bool
+
+# Typical workflow: find then replace
+for c in f.find_comments_containing("FIXME"):
+    f.replace_comment(c["offset"], "# resolved")
+if f.is_modified():
+    f.to_file(path)
+```
+
+---
+
 ## Python API — Module-level functions
 
 ### Batch edits
@@ -410,30 +568,38 @@ total, edited, errors = nasl_py.batch_remove_cve_id("/path/to/NVT-plugins", "CVE
 All search functions walk `directory` recursively and return a list of absolute `.nasl` file paths.
 
 ```python
-# Files containing a specific CVE
-nasl_py.find_files_with_cve("/path/to/NVT-plugins", "CVE-2023-44487")
+DIR = "/path/to/NVT-plugins"
 
-# Files where a script_tag has a specific value
-nasl_py.find_files_with_tag("/path/to/NVT-plugins", "solution_type", "WillNotFix")
+# ── Metadata searches ────────────────────────────────────────────────────────
+nasl_py.find_files_with_cve(DIR, "CVE-2023-44487")
+nasl_py.find_files_with_tag(DIR, "solution_type", "WillNotFix")
+nasl_py.find_files_missing_tag(DIR, "epss_score")
+nasl_py.find_files_in_family(DIR, "Web application abuses")
+nasl_py.find_files_with_include(DIR, "http_func.inc")
+nasl_py.find_files_with_dependency(DIR, "gb_nmap_installed_lin.nasl")
+nasl_py.find_files_with_holm_marker(DIR)
+nasl_py.find_files_with_pci_key(DIR, "holm/pci/xss")
 
-# Files missing a script_tag entirely
-nasl_py.find_files_missing_tag("/path/to/NVT-plugins", "epss_score")
+# ── Code body searches ───────────────────────────────────────────────────────
+# Files that contain at least one call to fn_name
+nasl_py.find_files_with_call(DIR, "http_send_recv")
+nasl_py.find_files_with_call(DIR, "security_message")
 
-# Files in a specific family
-nasl_py.find_files_in_family("/path/to/NVT-plugins", "Web application abuses")
+# Files that contain at least one assignment to var_name
+nasl_py.find_files_with_assignment(DIR, "port")
+nasl_py.find_files_with_assignment(DIR, "timeout")
 
-# Files with a specific include
-nasl_py.find_files_with_include("/path/to/NVT-plugins", "http_func.inc")
+# Files that contain a comment with the given substring
+nasl_py.find_files_with_comment(DIR, "TODO")
+nasl_py.find_files_with_comment(DIR, "holm")
 
-# Files with a specific direct dependency
-nasl_py.find_files_with_dependency("/path/to/NVT-plugins", "gb_nmap_installed_lin.nasl")
-
-# Files with any Holm modification marker
-nasl_py.find_files_with_holm_marker("/path/to/NVT-plugins")
-
-# Files whose security_message blocks contain a specific PCI key
-nasl_py.find_files_with_pci_key("/path/to/NVT-plugins", "holm/pci/xss")
+# ── Version date searches ────────────────────────────────────────────────────
+nasl_py.find_files_with_version_before(DIR, "2024-01-01")
+nasl_py.find_files_with_version_after(DIR, "2025-01-01")
+nasl_py.find_files_with_version_between(DIR, "2024-01-01", "2024-12-31")
 ```
+
+Date strings accept `"YYYY-MM-DD"`, `"YYYY/MM/DD"`, or `"YYYY-MM-DDTHH:MM:SS[+offset]"`.
 
 ---
 
@@ -499,6 +665,56 @@ let new_source = apply_edits(&source, edits);
 ```
 
 All `queries::*` functions are pure: they take `&SyntaxNode` and return plain values or `Edit` structs. No mutable state, no allocations beyond the returned values.
+
+#### Code block queries (v0.3.0+)
+
+```rust
+use nasl_cst::queries::{
+    find_calls, replace_call_positional_arg, replace_call_named_arg,
+    find_if_blocks_with_call, find_if_blocks_with_condition_text,
+    insert_before_call, insert_after_call,
+    insert_at_start_of_if_block, insert_at_end_of_if_block,
+    find_assignments, replace_assignment,
+    get_tree, replace_range_edit,
+    get_comments, find_comments_containing, replace_comment_at,
+};
+
+let root = &parse(&source).root;
+
+// Find all call sites
+let calls = find_calls(root, "http_send_recv");
+// calls[0].text, .offset, .args, .named_args
+
+// Replace named arg in all calls
+let edits = replace_call_named_arg(root, "http_send_recv", "port", "port2");
+let new_source = apply_edits(&source, edits);
+
+// Insert statement after every standalone call
+let edits = insert_after_call(root, "security_message", "log_message(data:\"done\");");
+let new_source = apply_edits(&source, edits);
+
+// Find if-blocks
+let blocks = find_if_blocks_with_call(root, "security_message");
+let blocks = find_if_blocks_with_condition_text(root, "get_kb_item");
+// blocks[0].condition, .text, .offset
+
+// Variable assignments
+let assigns = find_assignments(root, "port");
+let edit = replace_assignment(root, "port", "443");
+
+// Full tree — walk manually
+let tree = get_tree(root);
+// tree.kind, .offset, .length, .is_token, .text, .children
+
+// Edit any byte range by offset+length from get_tree()
+let edit = replace_range_edit(tree.offset, tree.length, "replacement");
+let new_source = apply_edits(&source, vec![edit]);
+
+// Comments
+let comments = get_comments(root);           // Vec<CommentInfo>
+let matches  = find_comments_containing(root, "TODO");
+let edit     = replace_comment_at(root, 42, "# resolved");
+```
 
 ---
 
