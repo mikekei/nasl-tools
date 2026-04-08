@@ -1,0 +1,11 @@
+[package]
+name = "nasl-cst"
+version = "0.1.0"
+edition = "2021"
+description = "Lossless Concrete Syntax Tree parser for NASL (Nessus Attack Scripting Language)"
+
+[dependencies]
+rowan = "0.15"
+walkdir = "2"
+
+[dev-dependencies]

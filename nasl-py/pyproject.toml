@@ -1,0 +1,12 @@
+[build-system]
+requires = ["maturin>=1.4,<2"]
+build-backend = "maturin"
+
+[project]
+name = "nasl-py"
+version = "0.1.0"
+description = "Python bindings for the NASL CST parser (powered by Rowan)"
+requires-python = ">=3.8"
+
+[tool.maturin]
+module-name = "nasl_py"

@@ -1,0 +1,3 @@
+[workspace]
+members = ["nasl-cst", "nasl-py"]
+resolver = "2"

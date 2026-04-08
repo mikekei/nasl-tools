@@ -1,0 +1,91 @@
+name: Publish to GitHub Releases
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+# Deny all permissions by default; each job grants only what it needs.
+permissions: read-all
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      matrix:
+        # Hardcoded values — not from user input, no injection risk.
+        target: [x86_64, aarch64]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: PyO3/maturin-action@04ac600d27cdf7a9a280dadf7147097c42b757ad # v1
+        with:
+          target: ${{ matrix.target }}
+          manylinux: auto
+          working-directory: nasl-py
+          args: --release --out dist --find-interpreter
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: wheels-linux-${{ matrix.target }}
+          path: nasl-py/dist
+
+  macos:
+    runs-on: macos-latest
+    permissions:
+      contents: read
+    strategy:
+      matrix:
+        target: [x86_64, aarch64]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: PyO3/maturin-action@04ac600d27cdf7a9a280dadf7147097c42b757ad # v1
+        with:
+          target: ${{ matrix.target }}
+          working-directory: nasl-py
+          args: --release --out dist --find-interpreter
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: wheels-macos-${{ matrix.target }}
+          path: nasl-py/dist
+
+  windows:
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: PyO3/maturin-action@04ac600d27cdf7a9a280dadf7147097c42b757ad # v1
+        with:
+          target: x86_64
+          working-directory: nasl-py
+          args: --release --out dist --find-interpreter
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: wheels-windows-x86_64
+          path: nasl-py/dist
+
+  release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: [linux, macos, windows]
+    permissions:
+      contents: write  # required to create releases and upload assets
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: wheels-*
+          merge-multiple: true
+          path: dist
+
+      - uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2
+        with:
+          files: dist/*
+          generate_release_notes: true
