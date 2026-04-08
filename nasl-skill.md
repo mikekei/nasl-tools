@@ -11,6 +11,14 @@ Load single files with `nasl_py.NaslFile.from_file(path)`.
 
 ---
 
+## Install / update this skill
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/mikekei/nasl-tools/refs/heads/main/nasl-skill.md -o ~/.claude/commands/nasl.md
+```
+
+---
+
 ## How to operate
 
 ### Step 0 — verify the library is installed
